@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <sys/msg.h>
 #include <sys/types.h>
+#include <errno.h>
 
 /* =====================================================================
    Stałe i definicje
@@ -20,10 +21,15 @@
 
 /* ---------------------------------------------------
    Struktura wiadomości do kolejki komunikatów (SysV)
+
+   UWAGA: msgrcv/msgrcv operują na polu "mtext" –
+   samo pole mtext MUSI mieć rozmiar, jaki podajemy
+   jako trzeci argument w msgrcv/msgsnd.
+   Dlatego w msgrcv używamy sizeof(msg.mtext).
    --------------------------------------------------- */
 struct msgbuf {
-    long mtype;          // typ komunikatu
-    char mtext[128];     // treść komunikatu (np. numer sygnału)
+    long mtype;          // typ komunikatu (musi być > 0)
+    char mtext[128];     // treść komunikatu
 };
 
 /* =====================================================================
@@ -43,7 +49,7 @@ int   g_msqid = -1;   // id kolejki komunikatów
    ----------------------------- */
 void signal_handler_p3(int sig)
 {
-    // Proces 3 po odebraniu sygnału (np. SIGUSR1) chce poinformować rodzica
+    // Proces 3 po odebraniu sygnału (np. SIGUSR1) informuje rodzica (SIGUSR2)
     printf("[Process 3] Odebrano sygnał %d, wysyłam SIGUSR2 do rodzica.\n", sig);
     kill(getppid(), SIGUSR2);  // proces 3 -> rodzic
 }
@@ -53,14 +59,15 @@ void signal_handler_p3(int sig)
    ----------------------------------------- */
 void signal_handler_parent(int sig)
 {
-    // Rodzic otrzymuje SIGUSR2 od P3, zapisuje info do kolejki i powiadamia P1
     if (sig == SIGUSR2) {
+        // Rodzic otrzymuje SIGUSR2 od P3, zapisuje info do kolejki i powiadamia P1
         printf("[Parent] Odebrano SIGUSR2 od procesu 3. Zapisuję do kolejki.\n");
 
         struct msgbuf msg;
         msg.mtype = 1;  // typ 1 (np. info od P3)
         snprintf(msg.mtext, sizeof(msg.mtext), "Powiadomienie od P3 (SIGUSR1->SIGUSR2)");
 
+        // Wysyłamy do kolejki
         if (msgsnd(g_msqid, &msg, strlen(msg.mtext)+1, 0) == -1) {
             perror("[Parent] msgsnd");
         }
@@ -82,16 +89,17 @@ void signal_handler_p1(int sig)
     printf("[Process 1] Odebrano sygnał %d, odczytuję kolejkę.\n", sig);
 
     struct msgbuf msg;
-    // Odczytujemy komunikat typu 1
-    if (msgrcv(g_msqid, &msg, sizeof(msg.mtext), 1, IPC_NOWAIT) != -1) {
+    // UWAGA: rozmiar -> sizeof(msg.mtext), nie całej struktury
+    if (msgrcv(g_msqid, &msg, sizeof(msg.mtext), 1, IPC_NOWAIT) == -1) {
+        perror("[Process 1] msgrcv");
+    } else {
         printf("[Process 1] Odczytano z kolejki: %s\n", msg.mtext);
+
         // Powiadamiamy proces 2
         if (g_pid2 > 0) {
             printf("[Process 1] Wysyłam SIGUSR1 do procesu 2.\n");
             kill(g_pid2, SIGUSR1);
         }
-    } else {
-        perror("[Process 1] msgrcv");
     }
 }
 
@@ -104,11 +112,11 @@ void signal_handler_p2(int sig)
     printf("[Process 2] Odebrano sygnał %d, odczytuję kolejkę.\n", sig);
 
     struct msgbuf msg;
-    // Również odczytujemy typ 1 (o ile coś tam jest)
-    if (msgrcv(g_msqid, &msg, sizeof(msg.mtext), 1, IPC_NOWAIT) != -1) {
-        printf("[Process 2] Odczytano z kolejki: %s\n", msg.mtext);
-    } else {
+    // Również odbieramy typ 1
+    if (msgrcv(g_msqid, &msg, sizeof(msg.mtext), 1, IPC_NOWAIT) == -1) {
         perror("[Process 2] msgrcv");
+    } else {
+        printf("[Process 2] Odczytano z kolejki: %s\n", msg.mtext);
     }
 
     // Powiadamiamy proces 3, że także coś może zrobić
@@ -163,8 +171,9 @@ void setup_signals_and_queue(pid_t pid1, pid_t pid2, pid_t pid3)
         perror("[Parent] msgget");
         exit(1);
     }
+    printf("[Parent] Kolejka utworzona (g_msqid = %d)\n", g_msqid);
 
-    // Ustawiamy handler w rodzicu (nasłuchujemy np. SIGUSR2 od P3)
+    // Ustawiamy handler sygnału w rodzicu (nasłuchujemy np. SIGUSR2 od P3)
     struct sigaction sa_parent;
     memset(&sa_parent, 0, sizeof(sa_parent));
     sa_parent.sa_handler = signal_handler_parent;
@@ -175,6 +184,7 @@ void setup_signals_and_queue(pid_t pid1, pid_t pid2, pid_t pid3)
    Oryginalne funkcje: process1, process2, process3
    (bez zmian w środku!)
    ===================================================================== */
+
 void process1(int fd_write) {
     printf("[Process 1] Starting process 1\n");
     char buffer[256];
@@ -316,7 +326,7 @@ int main() {
         process3();
     }
 
-    // W procesie macierzystym podłączamy mechanizm sygnałów i kolejki
+    // Tu, w rodzicu, dopiero po utworzeniu wszystkich dzieci:
     setup_signals_and_queue(pid1, pid2, pid3);
 
     close(pipe_fd[0]);
@@ -337,9 +347,10 @@ int main() {
     // Sprzątamy pamięć współdzieloną
     shmctl(shmget(ftok("shmfile", 65), SHM_SIZE, 0666 | IPC_CREAT), IPC_RMID, NULL);
 
-    // Sprzątamy kolejkę komunikatów
+    // Sprzątamy kolejkę komunikatów (tylko jeśli istnieje)
     if (g_msqid != -1) {
         msgctl(g_msqid, IPC_RMID, NULL);
+        printf("[Main] Kolejka komunikatów usunięta\n");
     }
 
     printf("[Main] Cleaned up resources and exiting\n");
