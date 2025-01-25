@@ -2,191 +2,82 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
-#include <sys/wait.h>
-#include <semaphore.h>
-#include <fcntl.h>
-
-#include <signal.h>
 #include <sys/msg.h>
-#include <sys/types.h>
-#include <errno.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <semaphore.h>
 
-/* =====================================================================
-   Stałe i definicje
-   ===================================================================== */
+// ---------------------------------
+// Konfiguracje
+// ---------------------------------
+
 #define SHM_SIZE 1024
-#define MSGQ_KEY 0x12345
 
-/* ---------------------------------------------------
-   Struktura wiadomości do kolejki komunikatów (SysV)
-
-   UWAGA: msgrcv/msgrcv operują na polu "mtext" –
-   samo pole mtext MUSI mieć rozmiar, jaki podajemy
-   jako trzeci argument w msgrcv/msgsnd.
-   Dlatego w msgrcv używamy sizeof(msg.mtext).
-   --------------------------------------------------- */
-struct msgbuf {
-    long mtype;          // typ komunikatu (musi być > 0)
-    char mtext[128];     // treść komunikatu
+// Struktura wiadomości w kolejce
+struct msgBuf {
+    long mtype;    // typ wiadomości
+    int  signo;    // numer sygnału
 };
 
-/* =====================================================================
-   Zmienne globalne na potrzeby sygnałów i kolejki
-   ===================================================================== */
-pid_t g_pid1 = 0;
-pid_t g_pid2 = 0;
-pid_t g_pid3 = 0;
-int   g_msqid = -1;   // id kolejki komunikatów
+// Globalne identyfikatory do kolejek, semaforów itp.
+int  msgid;        // ID kolejki komunikatów
+int  shmid;        // ID pamięci współdzielonej
+pid_t mainPID;     // PID procesu macierzystego
+pid_t p1PID, p2PID, p3PID; // PID-y poszczególnych procesów
 
-/* =====================================================================
-   Handlery sygnałów
-   ===================================================================== */
+// Semafory
+sem_t *sem2 = NULL;
+sem_t *sem3 = NULL;
 
-/* -----------------------------
-   Handler sygnału w procesie 3
-   ----------------------------- */
-void signal_handler_p3(int sig)
-{
-    // Proces 3 po odebraniu sygnału (np. SIGUSR1) informuje rodzica (SIGUSR2)
-    printf("[Process 3] Odebrano sygnał %d, wysyłam SIGUSR2 do rodzica.\n", sig);
-    kill(getppid(), SIGUSR2);  // proces 3 -> rodzic
-}
+// ---------------------------------
+// Funkcje pomocnicze do kolejki
+// ---------------------------------
 
-/* -----------------------------------------
-   Handler sygnału w procesie macierzystym
-   ----------------------------------------- */
-void signal_handler_parent(int sig)
-{
-    if (sig == SIGUSR2) {
-        // Rodzic otrzymuje SIGUSR2 od P3, zapisuje info do kolejki i powiadamia P1
-        printf("[Parent] Odebrano SIGUSR2 od procesu 3. Zapisuję do kolejki.\n");
-
-        struct msgbuf msg;
-        msg.mtype = 1;  // typ 1 (np. info od P3)
-        snprintf(msg.mtext, sizeof(msg.mtext), "Powiadomienie od P3 (SIGUSR1->SIGUSR2)");
-
-        // Wysyłamy do kolejki
-        if (msgsnd(g_msqid, &msg, strlen(msg.mtext)+1, 0) == -1) {
-            perror("[Parent] msgsnd");
-        }
-
-        // Powiadamiamy proces 1 sygnałem SIGUSR1
-        if (g_pid1 > 0) {
-            printf("[Parent] Wysyłam SIGUSR1 do procesu 1.\n");
-            kill(g_pid1, SIGUSR1);
-        }
+// Funkcja wysyłająca numer sygnału do kolejki (o podanym typie)
+void sendSignalToQueue(int signo, long mtype) {
+    struct msgBuf message;
+    message.mtype = mtype;
+    message.signo = signo;
+    if (msgsnd(msgid, &message, sizeof(message.signo), 0) == -1) {
+        perror("[sendSignalToQueue] msgsnd error");
     }
 }
 
-/* -----------------------------
-   Handler sygnału w procesie 1
-   ----------------------------- */
-void signal_handler_p1(int sig)
-{
-    // P1 po otrzymaniu SIGUSR1 odczytuje kolejkę i powiadamia P2
-    printf("[Process 1] Odebrano sygnał %d, odczytuję kolejkę.\n", sig);
-
-    struct msgbuf msg;
-    // UWAGA: rozmiar -> sizeof(msg.mtext), nie całej struktury
-    if (msgrcv(g_msqid, &msg, sizeof(msg.mtext), 1, IPC_NOWAIT) == -1) {
-        perror("[Process 1] msgrcv");
-    } else {
-        printf("[Process 1] Odczytano z kolejki: %s\n", msg.mtext);
-
-        // Powiadamiamy proces 2
-        if (g_pid2 > 0) {
-            printf("[Process 1] Wysyłam SIGUSR1 do procesu 2.\n");
-            kill(g_pid2, SIGUSR1);
-        }
+// Funkcja odczytująca numer sygnału z kolejki (o podanym typie)
+int receiveSignalFromQueue(long mtype) {
+    struct msgBuf message;
+    if (msgrcv(msgid, &message, sizeof(message.signo), mtype, 0) == -1) {
+        perror("[receiveSignalFromQueue] msgrcv error");
+        return -1;
     }
+    return message.signo;
 }
 
-/* -----------------------------
-   Handler sygnału w procesie 2
-   ----------------------------- */
-void signal_handler_p2(int sig)
-{
-    // P2 po otrzymaniu SIGUSR1 może ponownie odczytać kolejkę i na koniec powiadomić P3
-    printf("[Process 2] Odebrano sygnał %d, odczytuję kolejkę.\n", sig);
+// ---------------------------------
+// Deklaracje handlerów sygnałów
+// ---------------------------------
 
-    struct msgbuf msg;
-    // Również odbieramy typ 1
-    if (msgrcv(g_msqid, &msg, sizeof(msg.mtext), 1, IPC_NOWAIT) == -1) {
-        perror("[Process 2] msgrcv");
-    } else {
-        printf("[Process 2] Odczytano z kolejki: %s\n", msg.mtext);
-    }
+void sigusr2_handler_main(int signo);
+void sigusr1_handler_p1(int signo);
+void sigusr1_handler_p2(int signo);
+void sigusr1_handler_p3(int signo);
+void sigtstp_handler_p3(int signo);
 
-    // Powiadamiamy proces 3, że także coś może zrobić
-    if (g_pid3 > 0) {
-        printf("[Process 2] Wysyłam SIGUSR1 do procesu 3.\n");
-        kill(g_pid3, SIGUSR1);
-    }
-}
-
-/* =====================================================================
-   Funkcje inicjalizujące sygnały i kolejkę
-   ===================================================================== */
-
-/* Wywoływane w procesie 1 */
-void setup_signals_for_proc1(void)
-{
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = signal_handler_p1;
-    sigaction(SIGUSR1, &sa, NULL);
-}
-
-/* Wywoływane w procesie 2 */
-void setup_signals_for_proc2(void)
-{
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = signal_handler_p2;
-    sigaction(SIGUSR1, &sa, NULL);
-}
-
-/* Wywoływane w procesie 3 */
-void setup_signals_for_proc3(void)
-{
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = signal_handler_p3;
-    sigaction(SIGUSR1, &sa, NULL);
-}
-
-/* Wywoływane w procesie macierzystym (main) – tworzy kolejkę i ustawia handler */
-void setup_signals_and_queue(pid_t pid1, pid_t pid2, pid_t pid3)
-{
-    // Zachowujemy PID‐y dzieci w zmiennych globalnych
-    g_pid1 = pid1;
-    g_pid2 = pid2;
-    g_pid3 = pid3;
-
-    // Tworzymy kolejkę (lub otwieramy, jeśli istnieje)
-    g_msqid = msgget(MSGQ_KEY, 0666 | IPC_CREAT);
-    if (g_msqid == -1) {
-        perror("[Parent] msgget");
-        exit(1);
-    }
-    printf("[Parent] Kolejka utworzona (g_msqid = %d)\n", g_msqid);
-
-    // Ustawiamy handler sygnału w rodzicu (nasłuchujemy np. SIGUSR2 od P3)
-    struct sigaction sa_parent;
-    memset(&sa_parent, 0, sizeof(sa_parent));
-    sa_parent.sa_handler = signal_handler_parent;
-    sigaction(SIGUSR2, &sa_parent, NULL);
-}
-
-/* =====================================================================
-   Oryginalne funkcje: process1, process2, process3
-   (bez zmian w środku!)
-   ===================================================================== */
+// ---------------------------------
+// Proces 1
+// ---------------------------------
 
 void process1(int fd_write) {
-    printf("[Process 1] Starting process 1\n");
+    // Ustawiamy PID procesu 1 globalnie (pomocniczo, żeby było wiadomo, kto jest kim)
+    p1PID = getpid();
+    printf("[Process 1] Starting (PID=%d)\n", p1PID);
+
+    // Ustawiamy obsługę sygnałów – np. SIGUSR1
+    signal(SIGUSR1, sigusr1_handler_p1);
+
     char buffer[256];
     while (fgets(buffer, sizeof(buffer), stdin) != NULL) {
         size_t len = strlen(buffer);
@@ -203,9 +94,19 @@ void process1(int fd_write) {
     exit(0);
 }
 
+// ---------------------------------
+// Proces 2
+// ---------------------------------
+
 void process2(int fd_read) {
-    printf("[Process 2] Starting process 2\n");
-    int shmid = shmget(ftok("shmfile", 65), SHM_SIZE, 0666 | IPC_CREAT);
+    p2PID = getpid();
+    printf("[Process 2] Starting (PID=%d)\n", p2PID);
+
+    // Ustawiamy obsługę sygnału SIGUSR1
+    signal(SIGUSR1, sigusr1_handler_p2);
+
+    // Uzyskanie segmentu pamięci współdzielonej
+    shmid = shmget(ftok("shmfile", 65), SHM_SIZE, 0666 | IPC_CREAT);
     if (shmid == -1) {
         perror("[Process 2] shmget failed");
         exit(1);
@@ -218,8 +119,8 @@ void process2(int fd_read) {
     }
     printf("[Process 2] Shared memory attached\n");
 
-    sem_t *sem2 = sem_open("/sem2", O_CREAT, 0666, 0);
-    sem_t *sem3 = sem_open("/sem3", O_CREAT, 0666, 0);
+    sem2 = sem_open("/sem2", O_CREAT, 0666, 0);
+    sem3 = sem_open("/sem3", O_CREAT, 0666, 0);
     if (sem2 == SEM_FAILED || sem3 == SEM_FAILED) {
         perror("[Process 2] sem_open failed");
         exit(1);
@@ -238,10 +139,11 @@ void process2(int fd_read) {
         snprintf(shared_memory, SHM_SIZE, "%lu", len);
         printf("[Process 2] Wrote length %lu to shared memory\n", len);
 
-        sem_post(sem3); // Notify process 3
-        printf("[Process 2] Signaled process 3\n");
-        sem_wait(sem2); // Wait for response from process 3
-        printf("[Process 2] Received signal from process 3\n");
+        // Wysłanie sygnału do sem3 i oczekiwanie na sem2
+        sem_post(sem3); 
+        printf("[Process 2] Signaled process 3 (sem3)\n");
+        sem_wait(sem2);
+        printf("[Process 2] Received signal from process 3 (sem2)\n");
     }
 
     printf("[Process 2] No more data from pipe, signaling end to process 3\n");
@@ -253,9 +155,20 @@ void process2(int fd_read) {
     exit(0);
 }
 
+// ---------------------------------
+// Proces 3
+// ---------------------------------
+
 void process3() {
-    printf("[Process 3] Starting process 3\n");
-    int shmid = shmget(ftok("shmfile", 65), SHM_SIZE, 0666 | IPC_CREAT);
+    p3PID = getpid();
+    printf("[Process 3] Starting (PID=%d)\n", p3PID);
+
+    // Obsługa sygnałów: SIGUSR1 (powiadomienie z procesów 1/2) oraz SIGTSTP (od użytkownika)
+    signal(SIGUSR1, sigusr1_handler_p3);
+    signal(SIGTSTP, sigtstp_handler_p3);
+
+    // Uzyskanie segmentu pamięci współdzielonej
+    shmid = shmget(ftok("shmfile", 65), SHM_SIZE, 0666 | IPC_CREAT);
     if (shmid == -1) {
         perror("[Process 3] shmget failed");
         exit(1);
@@ -268,12 +181,16 @@ void process3() {
     }
     printf("[Process 3] Shared memory attached\n");
 
-    sem_t *sem2 = sem_open("/sem2", O_CREAT, 0666, 0);
-    sem_t *sem3 = sem_open("/sem3", O_CREAT, 0666, 0);
+    sem2 = sem_open("/sem2", O_CREAT, 0666, 0);
+    sem3 = sem_open("/sem3", O_CREAT, 0666, 0);
+    if (sem2 == SEM_FAILED || sem3 == SEM_FAILED) {
+        perror("[Process 3] sem_open failed");
+        exit(1);
+    }
 
     while (1) {
-        sem_wait(sem3); // Wait for data from process 2
-        printf("[Process 3] Signal received from process 2\n");
+        sem_wait(sem3); 
+        printf("[Process 3] sem3 received\n");
 
         if (strcmp(shared_memory, "END") == 0) {
             printf("[Process 3] Received END signal, exiting\n");
@@ -281,58 +198,157 @@ void process3() {
         }
 
         printf("[Process 3] Received length: %s\n", shared_memory);
-        sem_post(sem2); // Notify process 2
-        printf("[Process 3] Signaled process 2\n");
+        sem_post(sem2);
+        printf("[Process 3] Signaled process 2 (sem2)\n");
     }
 
     shmdt(shared_memory);
     exit(0);
 }
 
-/* =====================================================================
-   Funkcja main – uruchamia procesy i włącza obsługę sygnałów/komunikatów
-   ===================================================================== */
+// ---------------------------------
+// Funkcje obsługi sygnałów
+// ---------------------------------
+
+// Handler w Main dla sygnału SIGUSR2 od procesu 3
+// Gdy proces 3 otrzyma SIGTSTP, wysyła SIGUSR2 do Main,
+// a Main umieszcza informację w kolejce i powiadamia proces 1.
+void sigusr2_handler_main(int signo) {
+    printf("[Main] Otrzymano sygnał SIGUSR2 od Process 3. Zapisuję sygnał (%d) do kolejki.\n", signo);
+
+    // Zapisujemy w kolejce komunikat (np. SIGTSTP = 20)
+    sendSignalToQueue(SIGTSTP, 1);  // umownie mtype=1 dla "pierwszego" w kolejce
+
+    // Powiadomienie procesu 1
+    printf("[Main] Wysyłam SIGUSR1 do Process 1 (PID=%d)\n", p1PID);
+    kill(p1PID, SIGUSR1);
+}
+
+// Handler w Procesie 1 (SIGUSR1)
+// - odczyt sygnału z kolejki
+// - wstawienie go ponownie (by kolejny proces mógł odczytać)
+// - powiadomienie Procesu 2
+// - SIGSTOP
+void sigusr1_handler_p1(int signo) {
+    printf("[Process 1] Otrzymałem SIGUSR1.\n");
+
+    int sig_from_queue = receiveSignalFromQueue(1); // Odczytujemy z mtype=1
+    if (sig_from_queue == SIGTSTP) {
+        printf("[Process 1] W kolejce był sygnał SIGTSTP (%d). Przekazuję dalej.\n", sig_from_queue);
+
+        // Odkładamy z powrotem do kolejki (tym razem np. mtype=2 dla p2)
+        sendSignalToQueue(sig_from_queue, 2);
+
+        // Powiadamiamy proces 2
+        printf("[Process 1] Wysyłam SIGUSR1 do Process 2 (PID=%d)\n", p2PID);
+        kill(p2PID, SIGUSR1);
+
+        // Zatrzymujemy się
+        printf("[Process 1] Wykonuję SIGSTOP.\n");
+        kill(getpid(), SIGSTOP);
+    }
+}
+
+// Handler w Procesie 2 (SIGUSR1)
+// - odczyt sygnału z kolejki (mtype=2)
+// - wstawienie go ponownie (mtype=3) dla procesu 3
+// - powiadomienie procesu 3
+// - SIGSTOP
+void sigusr1_handler_p2(int signo) {
+    printf("[Process 2] Otrzymałem SIGUSR1.\n");
+
+    int sig_from_queue = receiveSignalFromQueue(2);
+    if (sig_from_queue == SIGTSTP) {
+        printf("[Process 2] W kolejce był sygnał SIGTSTP (%d). Przekazuję dalej.\n", sig_from_queue);
+
+        // Odkładamy sygnał do kolejki z mtype=3
+        sendSignalToQueue(sig_from_queue, 3);
+
+        // Powiadamiamy proces 3
+        printf("[Process 2] Wysyłam SIGUSR1 do Process 3 (PID=%d)\n", p3PID);
+        kill(p3PID, SIGUSR1);
+
+        // Zatrzymujemy się
+        printf("[Process 2] Wykonuję SIGSTOP.\n");
+        kill(getpid(), SIGSTOP);
+    }
+}
+
+// Handler w Procesie 3 (SIGUSR1)
+// - odczyt sygnału z kolejki (mtype=3)
+// - jeśli to SIGTSTP, zatrzymanie procesu
+void sigusr1_handler_p3(int signo) {
+    printf("[Process 3] Otrzymałem SIGUSR1.\n");
+
+    int sig_from_queue = receiveSignalFromQueue(3);
+    if (sig_from_queue == SIGTSTP) {
+        printf("[Process 3] W kolejce był sygnał SIGTSTP (%d). Zatrzymuję się.\n", sig_from_queue);
+        kill(getpid(), SIGSTOP);
+    }
+}
+
+// Handler w Procesie 3 (SIGTSTP) - gdy użytkownik wciśnie np. Ctrl+Z
+// Proces 3 wysyła wtedy SIGUSR2 do procesu głównego
+void sigtstp_handler_p3(int signo) {
+    printf("[Process 3] Otrzymałem SIGTSTP od użytkownika. Informuję Main.\n");
+    kill(mainPID, SIGUSR2);
+}
+
+// ---------------------------------
+// Funkcja main
+// ---------------------------------
+
 int main() {
-    printf("[Main] Starting main process\n");
+    printf("[Main] Starting main process (PID=%d)\n", getpid());
+    mainPID = getpid();  // zapamiętujemy PID procesu głównego
+
+    // Tworzymy kolejkę komunikatów
+    key_t msgKey = ftok("msgqueue", 65);
+    msgid = msgget(msgKey, 0666 | IPC_CREAT);
+    if (msgid == -1) {
+        perror("[Main] msgget failed");
+        exit(1);
+    }
+
+    // Ustawiamy handler dla SIGUSR2 (odbierany od procesu 3)
+    signal(SIGUSR2, sigusr2_handler_main);
+
+    // Tworzymy potok
     int pipe_fd[2];
     if (pipe(pipe_fd) == -1) {
         perror("[Main] pipe failed");
         exit(1);
     }
 
-    // Tworzymy proces 1
+    // Uruchamiamy proces 1
     pid_t pid1 = fork();
     if (pid1 == 0) {
-        // Inicjalizacja sygnałów w procesie 1
-        setup_signals_for_proc1();
-        close(pipe_fd[0]);
+        // Proces potomny
+        close(pipe_fd[0]);   // niepotrzebne do czytania
         process1(pipe_fd[1]);
     }
+    p1PID = pid1;
 
-    // Tworzymy proces 2
+    // Uruchamiamy proces 2
     pid_t pid2 = fork();
     if (pid2 == 0) {
-        // Inicjalizacja sygnałów w procesie 2
-        setup_signals_for_proc2();
-        close(pipe_fd[1]);
+        close(pipe_fd[1]);   // niepotrzebne do pisania
         process2(pipe_fd[0]);
     }
+    p2PID = pid2;
 
-    // Tworzymy proces 3
+    // Uruchamiamy proces 3
     pid_t pid3 = fork();
     if (pid3 == 0) {
-        // Inicjalizacja sygnałów w procesie 3
-        setup_signals_for_proc3();
         process3();
     }
+    p3PID = pid3;
 
-    // Tu, w rodzicu, dopiero po utworzeniu wszystkich dzieci:
-    setup_signals_and_queue(pid1, pid2, pid3);
-
+    // Proces macierzysty
     close(pipe_fd[0]);
     close(pipe_fd[1]);
 
-    // Czekamy na zakończenie potomków
+    // Czekamy na zakończenie procesów potomnych
     waitpid(pid1, NULL, 0);
     printf("[Main] Process 1 finished\n");
     waitpid(pid2, NULL, 0);
@@ -340,19 +356,17 @@ int main() {
     waitpid(pid3, NULL, 0);
     printf("[Main] Process 3 finished\n");
 
-    // Sprzątamy semafory
+    // Usunięcie semaforów
     sem_unlink("/sem2");
     sem_unlink("/sem3");
 
-    // Sprzątamy pamięć współdzieloną
+    // Usunięcie pamięci współdzielonej
     shmctl(shmget(ftok("shmfile", 65), SHM_SIZE, 0666 | IPC_CREAT), IPC_RMID, NULL);
 
-    // Sprzątamy kolejkę komunikatów (tylko jeśli istnieje)
-    if (g_msqid != -1) {
-        msgctl(g_msqid, IPC_RMID, NULL);
-        printf("[Main] Kolejka komunikatów usunięta\n");
-    }
+    // Usunięcie kolejki komunikatów
+    msgctl(msgid, IPC_RMID, NULL);
 
     printf("[Main] Cleaned up resources and exiting\n");
+
     return 0;
 }
