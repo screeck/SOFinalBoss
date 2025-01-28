@@ -102,18 +102,36 @@ void p2_signals() {
     signal(SIGCONT, SIG_IGN);
 }
 
+/* ZMIENIONE: Ignorowanie EOF w pętli (opcjonalny usleep, aby nie obciążać CPU). */
 void run_p1() {
     printf("[P1, PID=%d] Started\n", getpid());
     p1_signals();
     close(pipe_fd[0]);
     
     char buffer[MAX_LINE];
-    while(fgets(buffer, MAX_LINE, stdin) != NULL) {
+
+    while (1) {
+        if (fgets(buffer, MAX_LINE, stdin) == NULL) {
+            // Sprawdzenie, czy przyczyną jest EOF
+            if (feof(stdin)) {
+                // Czyścimy status EOF
+                clearerr(stdin);
+                // Opcjonalnie mała przerwa, aby nie obciążać CPU ciągłym loopem
+                usleep(100000); 
+                continue;
+            } else {
+                // Inny błąd czytania
+                perror("[P1] Error reading stdin");
+                break;
+            }
+        }
+        
         if (!paused) {
             printf("[P1, PID=%d] Sending line: %s", getpid(), buffer);
             write(pipe_fd[1], buffer, strlen(buffer));
         }
     }
+
     close(pipe_fd[1]);
     printf("[P1, PID=%d] Exiting\n", getpid());
     exit(EXIT_SUCCESS);
@@ -165,7 +183,7 @@ void run_p3() {
 int main() {
     printf("[PARENT] Main process started (PID=%d)\n", getpid());
 
-    // --- DODANE: wybór źródła danych (klawiatura vs plik) ---
+    // --- Wybór źródła danych (klawiatura vs plik) ---
     int choice;
     char filename[256];
 
